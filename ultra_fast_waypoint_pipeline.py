@@ -1,6 +1,7 @@
-# waypoint_skeleton_pipeline_v4.py
+# -*- coding: utf-8 -*-
+# waypoint_skeleton_pipeline_v5.py
 # Segmentation → BEV → Distance-based BEV cleaning (removes thin branches)
-# → Zhang–Suen Skeleton → Pruned Main Path → Evenly Spaced Waypoints
+# → Guo–Hall Skeleton → Pruned Main Path → Waypoints → Direction Commands
 
 import os, cv2, time, math
 import numpy as np
@@ -21,12 +22,13 @@ TRIM_BOTTOM = 30
 CAM_FPS_HINT = 30
 
 # Tuning knobs
-SCALE_SKELETON = 0.5         # compute skeleton at this scale, then upsample
-PRUNE_BRANCH_LEN = 18        # pixels to prune tiny skeleton branches
-WAYPOINT_ARCSTEP = 40.0      # BEV pixels between waypoints (arc-length sampling)
+SCALE_SKELETON = 0.5
+PRUNE_BRANCH_LEN = 18
+WAYPOINT_ARCSTEP = 40.0
 WAYPOINT_COUNT_MAX = 12
-EMA_ALPHA = 0.35             # temporal smoothing for waypoints (0..1)
-DT_CORE_THRESH = 8.0         # distance (in px) kept from BEV edges (raise to trim more branches)
+EMA_ALPHA = 0.35
+DT_CORE_THRESH = 8.0
+TURN_THRESH_DEG = 20.0       # angle threshold for left/right turns
 # ============================
 
 # ---- Homography ----
@@ -67,104 +69,71 @@ def split_masks_from_output(m, road_id=ROAD_ID, sidewalk_id=SIDEWALK_ID):
         road = (m==road_id).astype(np.uint8)*255
     return sidewalk, road
 
-# ========= BEV cleaning (distance-based, removes thin branches) =========
+# ========= BEV cleaning =========
 def clean_sidewalk_mask(bev_mask_255, dt_thresh=DT_CORE_THRESH):
-    """
-    Remove narrow peninsulas / side bumps before skeletonization using
-    a distance-transform 'core' threshold.
-    """
     mask = bev_mask_255.copy().astype(np.uint8)
-
-    # Basic smooth/close to stabilize DT
     k7 = np.ones((7,7), np.uint8)
     k5 = np.ones((5,5), np.uint8)
     mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, k7, iterations=2)
     mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN,  k5, iterations=1)
-
-    # Distance to boundary; keep only the interior core
     dist = cv2.distanceTransform((mask>0).astype(np.uint8), cv2.DIST_L2, 5)
     core = (dist > float(dt_thresh)).astype(np.uint8) * 255
-
-    # Soft restore of boundary thickness so skeleton stays centered but continuous
     core = cv2.dilate(core, k5, iterations=1)
     core = cv2.morphologyEx(core, cv2.MORPH_CLOSE, k5, iterations=1)
     return core
 
-# ========= Fast Zhang–Suen =========
-def zhang_suen_thinning(img0):
-    img = (img0>0).astype(np.uint8)
-    prev = np.zeros_like(img)
-    while True:
-        P2 = np.roll(img, -1, 0); P3 = np.roll(np.roll(img,-1,0),-1,1); P4 = np.roll(img, -1, 1)
-        P5 = np.roll(np.roll(img,  1,0),-1,1); P6 = np.roll(img, 1, 0);   P7 = np.roll(np.roll(img,1,0),1,1)
-        P8 = np.roll(img, 1, 1);  P9 = np.roll(np.roll(img,-1,0), 1,1)
-        N = P2+P3+P4+P5+P6+P7+P8+P9
-        C = ((P2==0)&(P3==1)).astype(np.uint8)+((P3==0)&(P4==1)).astype(np.uint8)+\
-            ((P4==0)&(P5==1)).astype(np.uint8)+((P5==0)&(P6==1)).astype(np.uint8)+\
-            ((P6==0)&(P7==1)).astype(np.uint8)+((P7==0)&(P8==1)).astype(np.uint8)+\
-            ((P8==0)&(P9==1)).astype(np.uint8)+((P9==0)&(P2==1)).astype(np.uint8)
-        m1=(img==1)&(N>=2)&(N<=6)&(C==1)&((P2*P4*P6)==0)&((P4*P6*P8)==0)
-        img[m1]=0
-        P2 = np.roll(img, -1, 0); P3 = np.roll(np.roll(img,-1,0),-1,1); P4 = np.roll(img, -1, 1)
-        P5 = np.roll(np.roll(img,  1,0),-1,1); P6 = np.roll(img, 1, 0);   P7 = np.roll(np.roll(img,1,0),1,1)
-        P8 = np.roll(img, 1, 1);  P9 = np.roll(np.roll(img,-1,0), 1,1)
-        N = P2+P3+P4+P5+P6+P7+P8+P9
-        C = ((P2==0)&(P3==1)).astype(np.uint8)+((P3==0)&(P4==1)).astype(np.uint8)+\
-            ((P4==0)&(P5==1)).astype(np.uint8)+((P5==0)&(P6==1)).astype(np.uint8)+\
-            ((P6==0)&(P7==1)).astype(np.uint8)+((P7==0)&(P8==1)).astype(np.uint8)+\
-            ((P8==0)&(P9==1)).astype(np.uint8)+((P9==0)&(P2==1)).astype(np.uint8)
-        m2=(img==1)&(N>=2)&(N<=6)&(C==1)&((P2*P4*P8)==0)&((P2*P6*P8)==0)
-        img[m2]=0
-        if not np.any(img!=prev): break
-        prev[:] = img
-    return (img*255).astype(np.uint8)
+# ========= Skeletonization =========
+def skeletonize_cv2(mask_255):
+    """Fast & accurate skeletonization using OpenCV Guo–Hall."""
+    from cv2.ximgproc import thinning, THINNING_GUOHALL
+    bin_ = ((mask_255 > 0).astype(np.uint8)) * 255
+    skel = thinning(bin_, THINNING_GUOHALL)
+    skel = (skel * 255).astype(np.uint8)
+    return skel
 
-# ========= Skeleton + Waypoint utilities =========
+def extract_skeleton(bev_binary_0_255, trim_px=5):
+    kernel = np.ones((5,5), np.uint8)
+    bev_clean = cv2.morphologyEx(bev_binary_0_255, cv2.MORPH_CLOSE, kernel)
+    bev_clean = cv2.medianBlur(bev_clean,5)
+    _, binary = cv2.threshold(bev_clean,127,255,cv2.THRESH_BINARY)
+    skeleton = skeletonize_cv2(binary)
+    if trim_px>0:
+        skeleton[:trim_px,:]=0
+        skeleton[-trim_px:,:]=0
+        skeleton[:, :trim_px]=0
+        skeleton[:, -trim_px:]=0
+    return skeleton
+
+# ========= Skeleton utilities =========
 def prune_small_branches(skel, min_len=PRUNE_BRANCH_LEN):
     s = skel.copy()
     for _ in range(min_len):
         nb = cv2.filter2D((s>0).astype(np.uint8), -1, np.ones((3,3), np.uint8))
-        endpoints = ((s>0) & (nb==2))  # 1 neighbor + self
+        endpoints = ((s>0) & (nb==2))
         s[endpoints] = 0
     return s
 
 def main_path_from_bottom_center(skel):
-    """
-    Keep only the skeleton component connected to the bottom-center area.
-    Removes all stray paths and side branches.
-    """
     h, w = skel.shape
     bin_ = (skel > 0).astype(np.uint8)
-
-    # Connected components
     num, labels, stats, centroids = cv2.connectedComponentsWithStats(bin_)
     if num <= 1:
         return skel
-
-    # Define bottom center window (start zone)
     x_center = w // 2
-    y_bottom = h - 1
-    zone_w = int(w * 0.25)     # 25% of width
-    zone_h = int(h * 0.15)     # 15% of height near bottom
+    zone_w = int(w * 0.25)
+    zone_h = int(h * 0.15)
     x1, x2 = x_center - zone_w//2, x_center + zone_w//2
     y1, y2 = h - zone_h, h
-
-    # Determine which component touches bottom region
-    main_label = None
-    best_area = 0
+    main_label, best_area = None, 0
     for cid in range(1, num):
         comp_mask = (labels == cid)
-        # Check intersection with bottom zone
         if np.any(comp_mask[y1:y2, x1:x2]):
             area = stats[cid, cv2.CC_STAT_AREA]
             if area > best_area:
                 best_area = area
                 main_label = cid
-
     if main_label is None:
-        # fallback to largest component
         main_label = 1 + np.argmax(stats[1:, cv2.CC_STAT_AREA])
-
     main = ((labels == main_label).astype(np.uint8) * 255)
     return main
 
@@ -197,24 +166,29 @@ def ema_smooth(prev_pts, new_pts, alpha=EMA_ALPHA):
         out.append((sx,sy))
     return out
 
-# ========= Extract Skeleton =========
-def extract_skeleton(bev_binary_0_255, trim_px=5):
-    # Binary, light denoise
-    kernel = np.ones((5,5),np.uint8)
-    bev_clean = cv2.morphologyEx(bev_binary_0_255, cv2.MORPH_CLOSE, kernel)
-    bev_clean = cv2.medianBlur(bev_clean,5)
-    _,binary=cv2.threshold(bev_clean,127,255,cv2.THRESH_BINARY)
-
-    # scale down for speed
-    h0,w0 = binary.shape
-    small = cv2.resize(binary,(max(1,int(w0*SCALE_SKELETON)),max(1,int(h0*SCALE_SKELETON))),interpolation=cv2.INTER_NEAREST)
-    skeleton_small = zhang_suen_thinning(small)
-    skeleton = cv2.resize(skeleton_small,(w0,h0),interpolation=cv2.INTER_NEAREST)
-
-    if trim_px>0:
-        skeleton[:trim_px,:]=0; skeleton[-trim_px:,:]=0
-        skeleton[:, :trim_px]=0; skeleton[:, -trim_px:]=0
-    return skeleton
+# ========= Command generation =========
+def compute_commands(waypoints, turn_thresh_deg=TURN_THRESH_DEG):
+    """
+    Given ordered waypoints [(x,y), ...], compute simple textual commands.
+    Returns list like ['STRAIGHT', 'LEFT', 'RIGHT', 'STRAIGHT', ...]
+    """
+    if len(waypoints) < 3:
+        return []
+    cmds = []
+    def heading(p1, p2):
+        return math.degrees(math.atan2(p2[1]-p1[1], p2[0]-p1[0]))
+    for i in range(1, len(waypoints)-1):
+        h1 = heading(waypoints[i-1], waypoints[i])
+        h2 = heading(waypoints[i], waypoints[i+1])
+        dtheta = (h2 - h1 + 180) % 360 - 180
+        if abs(dtheta) < turn_thresh_deg:
+            cmds.append("STRAIGHT")
+        elif dtheta > 0:
+            cmds.append("TURN LEFT")
+        else:
+            cmds.append("TURN RIGHT")
+    cmds.append("STOP")
+    return cmds
 
 # ========= HUD =========
 def put_hud(img, lines, org=(10,25), scale=0.6, color=(255,255,255)):
@@ -231,9 +205,6 @@ def main():
     if not cap.isOpened():
         print(f"ERROR: cannot open {INPUT}"); return
     fps_in=cap.get(cv2.CAP_PROP_FPS) or CAM_FPS_HINT
-    W=int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)) or 1280
-    Hc=int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT)) or 720
-
     frame_id=0; times=[]; last_mask=None; last_waypoints_cam=None
 
     print("Running waypoint pipeline… (ESC to quit)")
@@ -257,7 +228,7 @@ def main():
         # 2) Split mask
         sidewalk_mask,road_mask=split_masks_from_output(seg)
 
-        # 3) BEV + distance-core cleaning
+        # 3) BEV + cleaning
         timing.start("bev")
         bev_sidewalk=cv2.warpPerspective(sidewalk_mask,H,BEV_SIZE)
         if TRIM_BOTTOM>0: bev_sidewalk=bev_sidewalk[:-TRIM_BOTTOM,:]
@@ -268,9 +239,7 @@ def main():
         timing.start("skeleton")
         skel = extract_skeleton(bev_sidewalk, trim_px=5)
         skel = prune_small_branches(skel, PRUNE_BRANCH_LEN)
-        h_b, w_b = skel.shape
         main_skel = main_path_from_bottom_center(skel)
-
         timing.end("skeleton")
 
         # 5) Waypoints
@@ -288,7 +257,15 @@ def main():
             waypoints_cam = last_waypoints_cam or []
         timing.end("waypoints")
 
-        # 6) Visualization
+        # 6) Commands
+        commands = compute_commands(waypoints_bev)
+        if commands:
+            print(" → ".join(commands))
+            current_cmd = commands[0]
+        else:
+            current_cmd = "..."
+        
+        # 7) Visualization
         timing.start("viz")
         bev_rgb=np.zeros((bev_sidewalk.shape[0],bev_sidewalk.shape[1],3),np.uint8)
         bev_rgb[bev_sidewalk>0]=(0,80,0)
@@ -310,9 +287,9 @@ def main():
         times.append(dt)
         fps=1.0/dt if dt>0 else 0
         hud=[f"Frame {frame_id}",f"FPS {fps:4.1f}",
-             f"Infer {timing.timings['inference'][-1]*1000 if timing.timings['inference'] else 0:.1f} ms",
              f"Skeleton {timing.timings['skeleton'][-1]*1000 if timing.timings['skeleton'] else 0:.1f} ms",
-             f"Waypoints {len(waypoints_cam)}"]
+             f"Waypoints {len(waypoints_cam)}",
+             f"Command: {current_cmd}"]
         put_hud(cam,hud,org=(10,28),scale=0.7)
 
         cv2.imshow("Cam",cam)
