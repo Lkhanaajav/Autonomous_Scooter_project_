@@ -14,21 +14,18 @@ from fast_road_detector import FastRoadDetector, Config
 ROAD_ID = 1
 SIDEWALK_ID = 2
 
-src_points = np.array([
-    [0.0,   717.0],
-    [1278.0, 717.0],
-    [860.0,  337.0],
-    [573.0,  329.0]
-], dtype=np.float32)
+src_points = np.array([[0, 718], [1279, 719], [787, 334], [641, 332]], dtype=np.float32)  # [BL, BR, TR, TL]
 
 dst_points = np.array([
-    [100, 480],  # bottom-left
-    [500, 480],  # bottom-right
-    [400, 100],  # top-right
+    [100, 580],  # bottom-left (close to camera)
+    [500, 580],  # bottom-right
+    [400, 100],  # top-right  ← not very far upward
     [200, 100]   # top-left
 ], dtype=np.float32)
 
-bev_size = (600, 500)  # (W, H)
+
+bev_size = (600, 600)
+
 H = cv2.getPerspectiveTransform(src_points, dst_points)
 Hinv = np.linalg.inv(H)
 
@@ -98,6 +95,39 @@ def zhang_suen_thinning(bin_img_0_255):
         if not changing1 and not changing2: break
 
     return (img * 255).astype(np.uint8)
+def prune_skeleton_graph(G, min_branch_length=40):
+    """
+    Removes short branches from skeleton graph (noise pruning).
+    min_branch_length: in pixels (adjust 20–60 for your BEV scale)
+    """
+    endpoints = [n for n in G.nodes if G.degree[n] == 1]
+    to_remove = set()
+
+    for ep in endpoints:
+        # Follow branch until a junction (degree != 2)
+        path = [ep]
+        current = ep
+        prev = None
+        total_len = 0.0
+
+        while True:
+            neighbors = [n for n in G.neighbors(current) if n != prev]
+            if not neighbors: break
+            next_node = neighbors[0]
+            total_len += G[current][next_node]["weight"]
+            path.append(next_node)
+
+            # Stop if we reach a junction or another endpoint
+            if G.degree[next_node] != 2: break
+            prev = current
+            current = next_node
+
+        # Mark for removal if too short
+        if total_len < min_branch_length:
+            to_remove.update(path)
+
+    G.remove_nodes_from(to_remove)
+    return G
 
 # =============================================================================
 # BEV skeleton & graph
@@ -173,13 +203,37 @@ def process_video(video_path, output_dir, stride=1, save_video=False):
 
         bev_sidewalk = cv2.warpPerspective(sidewalk_mask, H, bev_size)
         bev_road     = cv2.warpPerspective(road_mask, H, bev_size)
-
+        
         if TRIM_BOTTOM > 0:
             bev_sidewalk = bev_sidewalk[:bev_sidewalk.shape[0]-TRIM_BOTTOM, :]
             bev_road     = bev_road[:bev_road.shape[0]-TRIM_BOTTOM, :]
+        cv2.imwrite(os.path.join(output_dir, f"bev_sidewalk_{frame_id:04d}.png"), bev_sidewalk)
+        cv2.imwrite(os.path.join(output_dir, f"bev_road_{frame_id:04d}.png"), bev_road)
 
         skeleton_mask, graph = extract_skeleton_graph(bev_sidewalk, trim_px=5)
+
         endpoints = skeleton_endpoints(graph)
+        # === Paper-friendly standalone skeleton ===
+        # convert to RGB white background
+        skeleton_viz = np.full((skeleton_mask.shape[0], skeleton_mask.shape[1], 3), 255, np.uint8)
+
+        # slightly dilate for better visibility
+        skeleton_thick = cv2.dilate(
+            skeleton_mask,
+            cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5)),
+            iterations=1
+        )
+
+        # paint skeleton as elegant sky-blue (or any color you like)
+        skeleton_viz[skeleton_thick > 0] = (0, 0, 255)  # light blue for paper clarity
+
+        # optional: smooth edges for nicer anti-aliased look
+        skeleton_viz = cv2.GaussianBlur(skeleton_viz, (3, 3), 0)
+
+        # save it
+        cv2.imwrite(os.path.join(output_dir, f"bev_skeleton_{frame_id:04d}.png"), skeleton_viz,
+                    [cv2.IMWRITE_PNG_COMPRESSION, 0])
+
 
         # Pick the endpoint with largest y (lowest point)
         start = None
@@ -188,8 +242,36 @@ def process_video(video_path, output_dir, stride=1, save_video=False):
 
         H_bev,W_bev = skeleton_mask.shape
         bev_color = np.zeros((H_bev,W_bev,3),dtype=np.uint8)
-        bev_color[bev_road>0]=(255,120,0)
-        bev_color[bev_sidewalk>0]=(0,200,0)
+        # === Nice-looking publication style BEV visualization ===
+        H_bev, W_bev = skeleton_mask.shape
+        bev_color = np.zeros((H_bev, W_bev, 3), dtype=np.uint8)
+
+        # 1️⃣ Base color layers
+        bev_color[bev_road > 0]     = (0, 128, 255)     # road: blue-orange tone
+        bev_color[bev_sidewalk > 0] = (120, 255, 120)   # sidewalk: soft green
+
+        # 2️⃣ Smooth skeleton overlay
+        vis_skel = cv2.dilate(
+            skeleton_mask,
+            cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (25, 25)),
+            iterations=1
+        )
+
+        # create colored skeleton (sky-blue)
+        skeleton_layer = np.zeros_like(bev_color)
+        skeleton_layer[vis_skel > 0] = (100, 220, 255)  # sky blue
+
+        # blend softly
+        bev_color = cv2.addWeighted(skeleton_layer, 0.7, bev_color, 1.0, 0)
+
+        # 3️⃣ (optional) highlight endpoints or key nodes later
+        # for e in endpoints:
+        #     cv2.circle(bev_color, (int(e[0]), int(e[1])), 6, (255, 60, 60), -1)
+
+        # 4️⃣ optional: small contrast boost for paper output
+        bev_color = cv2.GaussianBlur(bev_color, (3, 3), 0)
+        bev_color = cv2.addWeighted(bev_color, 1.2, bev_color, 0, 0)
+
 
         # 🔹 Thicken skeleton for visualization only
         vis_skel = cv2.dilate(
@@ -243,4 +325,4 @@ def process_video(video_path, output_dir, stride=1, save_video=False):
 # Entry
 # =============================================================================
 if __name__=="__main__":
-    process_video("test_video_june_03_3.mp4","bev_paths_dijkstra",stride=3,save_video=False)
+    process_video("test_video_june_03_3.mp4","bev_paths_dijkstra",stride=1,save_video=False)
