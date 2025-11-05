@@ -7,38 +7,62 @@ import os, cv2, time, math
 import numpy as np
 from collections import defaultdict
 from fast_road_detector import FastRoadDetector, Config
+import networkx as nx
 
 # ========= Settings =========
 ROAD_ID = 1
 SIDEWALK_ID = 2
-MODEL_DIR = "models/my-segformer-road"
+MODEL_DIR = "models/checkpoint-4000"
 CONF_THRESH = 0.5
 INPUT = "test_video_june_03_3.mp4"   # or int(0) for webcam
-STRIDE = 4
+STRIDE = 5
 SHOW_SEG = True
-SAVE_VIDEO = False
-BEV_SIZE = (600, 500)        # (W, H)
+SAVE_VIDEO = True
+     # (W, H)
 TRIM_BOTTOM = 30
 CAM_FPS_HINT = 30
 
 # Tuning knobs
 SCALE_SKELETON = 0.5
-PRUNE_BRANCH_LEN = 18
+PRUNE_BRANCH_LEN = 12
 WAYPOINT_ARCSTEP = 40.0
 WAYPOINT_COUNT_MAX = 12
 EMA_ALPHA = 0.35
-DT_CORE_THRESH = 8.0
+DT_CORE_THRESH = 6.0
 TURN_THRESH_DEG = 20.0       # angle threshold for left/right turns
 # ============================
 
-# ---- Homography ----
-src_points = np.array([
-    [0.0,   717.0],
-    [1278.0, 717.0],
-    [860.0,  337.0],
-    [573.0,  329.0]
+# Output video path for demo (side-by-side Cam + BEV)
+DEMO_VIDEO_PATH = "demo_overlay.mp4"
+
+# Visualization palette for multi-path ribbons
+PATH_COLORS = [
+    (0,255,255), (255,255,0), (255,0,255),
+    (0,165,255), (0,255,128), (128,0,255),
+    (255,128,0), (0,128,255), (128,255,0)
+]
+
+# Bottom band (in pixels) used to pick start seeds on the BEV skeleton
+BOTTOM_BAND_PX = 30
+
+# Optional: straighten BEV boundaries by column-wise smoothing
+STRAIGHTEN_EDGES = True
+EDGE_SMOOTH_WIN = 21         # odd window size in pixels
+EDGE_MIN_WIDTH_PX = 8        # ignore columns narrower than this width
+
+src_points = np.array([[4, 716], [1275, 716], [777, 291], [654, 289]], dtype=np.float32)  # [BL, BR, TR, TL]
+
+dst_points = np.array([
+    [100, 880],  # bottom-left (close to camera)
+    [500, 880],  # bottom-right
+    [400, 60],   # top-right (farther upward)
+    [200, 60]    # top-left
 ], dtype=np.float32)
-dst_points = np.array([[100,480],[500,480],[400,100],[200,100]],dtype=np.float32)
+
+BEV_SIZE = (600, 900) 
+
+
+
 H = cv2.getPerspectiveTransform(src_points, dst_points)
 Hinv = np.linalg.inv(H)
 
@@ -82,6 +106,65 @@ def clean_sidewalk_mask(bev_mask_255, dt_thresh=DT_CORE_THRESH):
     core = cv2.morphologyEx(core, cv2.MORPH_CLOSE, k5, iterations=1)
     return core
 
+def straighten_bev_edges(mask_255, win=EDGE_SMOOTH_WIN, min_width_px=EDGE_MIN_WIDTH_PX):
+    """
+    Column-wise boundary smoothing in BEV to produce straighter edges.
+    For each x, find top/bottom y of foreground; smooth with moving average; refill.
+    """
+    m = (mask_255 > 0).astype(np.uint8)
+    H, W = m.shape
+    top = np.full(W, -1, dtype=np.int32)
+    bot = np.full(W, -1, dtype=np.int32)
+    last_top = -1
+    last_bot = -1
+    for x in range(W):
+        ys = np.where(m[:, x] > 0)[0]
+        if ys.size >= min_width_px:
+            top[x] = int(ys.min())
+            bot[x] = int(ys.max())
+            last_top = top[x]
+            last_bot = bot[x]
+        else:
+            # propagate last seen to avoid gaps
+            top[x] = last_top
+            bot[x] = last_bot
+
+    # replace remaining -1 by nearest valid values
+    for arr in (top, bot):
+        # forward fill
+        for x in range(1, W):
+            if arr[x] < 0:
+                arr[x] = arr[x-1]
+        # backward fill
+        for x in range(W-2, -1, -1):
+            if arr[x] < 0:
+                arr[x] = arr[x+1]
+
+    if win % 2 == 0:
+        win += 1
+    if win < 3:
+        win = 3
+    k = np.ones(win, dtype=np.float32) / float(win)
+    # pad by reflection for convolution
+    def smooth_1d(a):
+        pad = win // 2
+        ap = np.pad(a.astype(np.float32), (pad, pad), mode='reflect')
+        s = np.convolve(ap, k, mode='valid')
+        return s.astype(np.float32)
+
+    top_s = smooth_1d(top)
+    bot_s = smooth_1d(bot)
+
+    out = np.zeros_like(m, dtype=np.uint8)
+    for x in range(W):
+        y1 = int(round(top_s[x] if np.isfinite(top_s[x]) else 0))
+        y2 = int(round(bot_s[x] if np.isfinite(bot_s[x]) else -1))
+        y1 = max(0, min(H-1, y1))
+        y2 = max(0, min(H-1, y2))
+        if y2 >= y1:
+            out[y1:y2+1, x] = 255
+    return out
+
 # ========= Skeletonization =========
 def skeletonize_cv2(mask_255):
     """Fast & accurate skeletonization using OpenCV Guo–Hall."""
@@ -120,7 +203,7 @@ def main_path_from_bottom_center(skel):
     if num <= 1:
         return skel
     x_center = w // 2
-    zone_w = int(w * 0.25)
+    zone_w = int(w * 0.40)
     zone_h = int(h * 0.15)
     x1, x2 = x_center - zone_w//2, x_center + zone_w//2
     y1, y2 = h - zone_h, h
@@ -167,28 +250,28 @@ def ema_smooth(prev_pts, new_pts, alpha=EMA_ALPHA):
     return out
 
 # ========= Command generation =========
-def compute_commands(waypoints, turn_thresh_deg=TURN_THRESH_DEG):
-    """
-    Given ordered waypoints [(x,y), ...], compute simple textual commands.
-    Returns list like ['STRAIGHT', 'LEFT', 'RIGHT', 'STRAIGHT', ...]
-    """
-    if len(waypoints) < 3:
-        return []
-    cmds = []
-    def heading(p1, p2):
-        return math.degrees(math.atan2(p2[1]-p1[1], p2[0]-p1[0]))
-    for i in range(1, len(waypoints)-1):
-        h1 = heading(waypoints[i-1], waypoints[i])
-        h2 = heading(waypoints[i], waypoints[i+1])
-        dtheta = (h2 - h1 + 180) % 360 - 180
-        if abs(dtheta) < turn_thresh_deg:
-            cmds.append("STRAIGHT")
-        elif dtheta > 0:
-            cmds.append("TURN LEFT")
-        else:
-            cmds.append("TURN RIGHT")
-    cmds.append("STOP")
-    return cmds
+# def compute_commands(waypoints, turn_thresh_deg=TURN_THRESH_DEG):
+#     """
+#     Given ordered waypoints [(x,y), ...], compute simple textual commands.
+#     Returns list like ['STRAIGHT', 'LEFT', 'RIGHT', 'STRAIGHT', ...]
+#     """
+#     if len(waypoints) < 3:
+#         return []
+#     cmds = []
+#     def heading(p1, p2):
+#         return math.degrees(math.atan2(p2[1]-p1[1], p2[0]-p1[0]))
+#     for i in range(1, len(waypoints)-1):
+#         h1 = heading(waypoints[i-1], waypoints[i])
+#         h2 = heading(waypoints[i], waypoints[i+1])
+#         dtheta = (h2 - h1 + 180) % 360 - 180
+#         if abs(dtheta) < turn_thresh_deg:
+#             cmds.append("STRAIGHT")
+#         elif dtheta > 0:
+#             cmds.append("TURN LEFT")
+#         else:
+#             cmds.append("TURN RIGHT")
+#     cmds.append("STOP")
+#     return cmds
 
 # ========= HUD =========
 def put_hud(img, lines, org=(10,25), scale=0.6, color=(255,255,255)):
@@ -196,6 +279,27 @@ def put_hud(img, lines, org=(10,25), scale=0.6, color=(255,255,255)):
     for text in lines:
         cv2.putText(img,text,(org[0],y),cv2.FONT_HERSHEY_SIMPLEX,scale,color,2,cv2.LINE_AA)
         y+=int(24*scale)
+
+def put_hud_panel(img, lines, org=(10, 25), scale=0.7):
+    # Semi-transparent panel under text
+    pad_x, pad_y = 10, 8
+    max_w = 0
+    h_line = int(24 * scale)
+    for t in lines:
+        (tw, th), _ = cv2.getTextSize(t, cv2.FONT_HERSHEY_SIMPLEX, scale, 2)
+        max_w = max(max_w, tw)
+    panel_w = max_w + 2 * pad_x
+    panel_h = h_line * len(lines) + 2 * pad_y
+    x0, y0 = org[0], org[1] - int(0.8 * h_line)
+    x1, y1 = x0 + panel_w, y0 + panel_h
+    overlay = img.copy()
+    cv2.rectangle(overlay, (x0, y0), (x1, y1), (0, 0, 0), -1)
+    cv2.addWeighted(overlay, 0.45, img, 0.55, 0, img)
+    # Draw text on top
+    y = org[1]
+    for text in lines:
+        cv2.putText(img, text, (org[0] + pad_x, y), cv2.FONT_HERSHEY_SIMPLEX, scale, (255, 255, 255), 2, cv2.LINE_AA)
+        y += h_line
 
 # ========= Main =========
 def main():
@@ -206,6 +310,9 @@ def main():
         print(f"ERROR: cannot open {INPUT}"); return
     fps_in=cap.get(cv2.CAP_PROP_FPS) or CAM_FPS_HINT
     frame_id=0; times=[]; last_mask=None; last_waypoints_cam=None
+
+    # Lazy-init video writer after first composed frame (to know exact size)
+    vw_demo=None
 
     print("Running waypoint pipeline… (ESC to quit)")
 
@@ -231,8 +338,12 @@ def main():
         # 3) BEV + cleaning
         timing.start("bev")
         bev_sidewalk=cv2.warpPerspective(sidewalk_mask,H,BEV_SIZE)
+        bev_road=cv2.warpPerspective(road_mask,H,BEV_SIZE)
         if TRIM_BOTTOM>0: bev_sidewalk=bev_sidewalk[:-TRIM_BOTTOM,:]
+        if TRIM_BOTTOM>0: bev_road=bev_road[:-TRIM_BOTTOM,:]
         bev_sidewalk = clean_sidewalk_mask(bev_sidewalk, DT_CORE_THRESH)
+        if STRAIGHTEN_EDGES:
+            bev_sidewalk = straighten_bev_edges(bev_sidewalk, EDGE_SMOOTH_WIN, EDGE_MIN_WIDTH_PX)
         timing.end("bev")
 
         # 4) Skeleton
@@ -242,7 +353,7 @@ def main():
         main_skel = main_path_from_bottom_center(skel)
         timing.end("skeleton")
 
-        # 5) Waypoints
+        # 5) Waypoints (from main skeleton only)
         timing.start("waypoints")
         ordered = order_path_pixels_by_y_then_x(main_skel)
         waypoints_bev = sample_by_arclength(ordered, WAYPOINT_ARCSTEP, WAYPOINT_COUNT_MAX)
@@ -257,20 +368,91 @@ def main():
             waypoints_cam = last_waypoints_cam or []
         timing.end("waypoints")
 
-        # 6) Commands
-        commands = compute_commands(waypoints_bev)
-        if commands:
-            print(" → ".join(commands))
-            current_cmd = commands[0]
-        else:
-            current_cmd = "..."
+        # 6) Dijkstra on full skeleton starting from bottom band, enumerate all reachable endpoints
+        # Build graph from skel pixels (8-connectivity)
+        Hm, Wm = skel.shape
+        G = nx.Graph()
+        for y in range(Hm):
+            xs = np.where(skel[y] > 0)[0]
+            for x in xs:
+                for dy in (-1, 0, 1):
+                    for dx in (-1, 0, 1):
+                        if dx == 0 and dy == 0:
+                            continue
+                        ny, nx_ = y + dy, x + dx
+                        if 0 <= ny < Hm and 0 <= nx_ < Wm and skel[ny, nx_] > 0:
+                            G.add_edge((x, y), (nx_, ny), weight=math.hypot(dx, dy))
+
+        paths = []  # list of (path_pts, length)
+        if G.number_of_nodes() > 1:
+            endpoints = [n for n in G.nodes if G.degree[n] == 1]
+            # Choose start from bottom band, prefer endpoints; break ties by closeness to center
+            center_x = Wm // 2
+            band_nodes = [n for n in G.nodes if n[1] >= Hm - BOTTOM_BAND_PX]
+            band_endpoints = [n for n in endpoints if n[1] >= Hm - BOTTOM_BAND_PX]
+            def start_key(p):
+                return (p[1], -abs(p[0] - center_x))  # max y, then nearest to center
+            if band_endpoints:
+                start = max(band_endpoints, key=start_key)
+            elif band_nodes:
+                start = max(band_nodes, key=start_key)
+            else:
+                # fallback: global lowest endpoint or node
+                start = max(endpoints, key=lambda p: p[1]) if endpoints else max(G.nodes, key=lambda p: p[1])
+
+            # Dijkstra to all other endpoints
+            for end in endpoints:
+                if end == start:
+                    continue
+                try:
+                    path = nx.dijkstra_path(G, start, end, weight="weight")
+                    plen = nx.path_weight(G, path, weight="weight")
+                    paths.append((path, plen))
+                except nx.NetworkXNoPath:
+                    continue
+
+            # Sort by length (longest first)
+            paths.sort(key=lambda x: x[1], reverse=True)
+
+        # 6) Commands (disabled for demo-only video)
+        # commands = compute_commands(waypoints_bev)
+        # if commands:
+        #     print(" → ".join(commands))
+        #     current_cmd = commands[0]
+        # else:
+        #     current_cmd = "..."
         
-        # 7) Visualization
+        # 7) Visualization (nice skeleton styling)
         timing.start("viz")
-        bev_rgb=np.zeros((bev_sidewalk.shape[0],bev_sidewalk.shape[1],3),np.uint8)
-        bev_rgb[bev_sidewalk>0]=(0,80,0)
-        bev_rgb[skel>0]=(255,255,0)
-        bev_rgb[main_skel>0]=(0,255,255)
+        H_bev, W_bev = bev_sidewalk.shape
+        bev_rgb=np.zeros((H_bev,W_bev,3),np.uint8)
+
+        # Base color layers
+        bev_rgb[bev_road>0]=(0,128,255)       # road: blue-orange tone
+        bev_rgb[bev_sidewalk>0]=(120,255,120) # sidewalk: soft green
+
+        # Smooth, thick skeleton overlay
+        vis_skel = cv2.dilate(
+            skel,
+            cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (25, 25)),
+            iterations=1
+        )
+        skeleton_layer = np.zeros_like(bev_rgb)
+        skeleton_layer[vis_skel > 0] = (100, 220, 255)  # sky blue
+        bev_rgb = cv2.addWeighted(skeleton_layer, 0.7, bev_rgb, 1.0, 0)
+
+        # Highlight main skeleton stronger
+        vis_main = cv2.dilate(
+            main_skel,
+            cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (35, 35)),
+            iterations=1
+        )
+        gy, gx = np.where(vis_main > 0)
+        bev_rgb[gy, gx] = (0,128,0)
+
+        # Subtle contrast boost for paper/demo clarity
+        bev_rgb = cv2.GaussianBlur(bev_rgb, (3, 3), 0)
+        bev_rgb = cv2.addWeighted(bev_rgb, 1.2, bev_rgb, 0, 0)
 
         cam=frame.copy()
         if SHOW_SEG:
@@ -278,22 +460,57 @@ def main():
             overlay[road_mask>0]=(0,140,255)
             overlay[sidewalk_mask>0]=(0,200,0)
             cam=cv2.addWeighted(overlay,0.35,cam,1.0,0)
-        for (x,y) in waypoints_cam:
-            cv2.circle(cam,(x,y),6,(0,255,255),-1)
-        if len(waypoints_cam)>=2:
-            cv2.line(cam, waypoints_cam[0], waypoints_cam[min(3,len(waypoints_cam)-1)], (0,255,255), 2, cv2.LINE_AA)
+
+        # Draw all available paths (from start to each endpoint) as ribbons on BEV and Cam
+        for idx, (path_pts, plen) in enumerate(paths):
+            color = PATH_COLORS[idx % len(PATH_COLORS)]
+            path_np = np.int32(path_pts).reshape(-1, 1, 2)
+            # BEV ribbon
+            ribbon_mask = np.zeros((H_bev, W_bev), np.uint8)
+            cv2.polylines(ribbon_mask, [path_np], False, 255, thickness=28, lineType=cv2.LINE_AA)
+            ribbon_layer = np.zeros_like(bev_rgb)
+            ribbon_layer[ribbon_mask > 0] = color
+            glow = cv2.GaussianBlur(ribbon_layer, (0, 0), 6)
+            bev_rgb = cv2.addWeighted(glow, 0.22, bev_rgb, 1.0, 0)
+            bev_rgb = cv2.addWeighted(ribbon_layer, 0.65, bev_rgb, 1.0, 0)
+
+            # Cam ribbon via inverse homography
+            cam_ribbon = cv2.warpPerspective(ribbon_mask, Hinv, (cam.shape[1], cam.shape[0]))
+            cam_color = np.zeros_like(cam)
+            cam_color[cam_ribbon > 0] = color
+            cam_glow = cv2.GaussianBlur(cam_color, (0, 0), 6)
+            cam = cv2.addWeighted(cam_glow, 0.22, cam, 1.0, 0)
+            cam = cv2.addWeighted(cam_color, 0.55, cam, 1.0, 0)
 
         dt=time.time()-t0
         times.append(dt)
         fps=1.0/dt if dt>0 else 0
-        hud=[f"Frame {frame_id}",f"FPS {fps:4.1f}",
-             f"Skeleton {timing.timings['skeleton'][-1]*1000 if timing.timings['skeleton'] else 0:.1f} ms",
-             f"Waypoints {len(waypoints_cam)}",
-             f"Command: {current_cmd}"]
+        hud=[
+            f"Frame {frame_id}",
+            f"FPS {fps:4.1f}  (dt {(dt*1000):.1f} ms)",
+            f"Infer  {(timing.timings['inference'][-1]*1000 if timing.timings['inference'] else 0):.1f} ms",
+            f"BEV    {(timing.timings['bev'][-1]*1000 if timing.timings['bev'] else 0):.1f} ms",
+            f"Skel   {(timing.timings['skeleton'][-1]*1000 if timing.timings['skeleton'] else 0):.1f} ms",
+            f"Paths  {len(paths)}",
+        ]
         put_hud(cam,hud,org=(10,28),scale=0.7)
 
         cv2.imshow("Cam",cam)
         cv2.imshow("BEV",bev_rgb)
+
+        # Compose side-by-side demo frame and write to video if enabled
+        if SAVE_VIDEO:
+            # Match BEV height to camera height for horizontal stack
+            h_cam, w_cam = cam.shape[:2]
+            h_bev, w_bev = bev_rgb.shape[:2]
+            bev_resized = cv2.resize(bev_rgb, (int(w_bev * (h_cam / float(h_bev))), h_cam))
+            combined = np.hstack((cam, bev_resized))
+            # Draw HUD panel on the combined output as well
+            put_hud_panel(combined, hud, org=(10, 30), scale=0.7)
+            if vw_demo is None:
+                fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+                vw_demo = cv2.VideoWriter(DEMO_VIDEO_PATH, fourcc, fps_in, (combined.shape[1], combined.shape[0]))
+            vw_demo.write(combined)
         timing.end("viz")
 
         key=cv2.waitKey(1)&0xFF
@@ -301,6 +518,8 @@ def main():
         frame_id+=1
 
     cap.release(); cv2.destroyAllWindows()
+    if vw_demo is not None:
+        vw_demo.release()
     print("\n=== TIMING SUMMARY ===")
     print(timing.summary_str())
     if times:
