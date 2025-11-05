@@ -12,12 +12,31 @@ import networkx as nx
 # ========= Settings =========
 ROAD_ID = 1
 SIDEWALK_ID = 2
-MODEL_DIR = "models/checkpoint-4000"
+MODEL_DIR = "models/my-segformer-road"
 CONF_THRESH = 0.5
 INPUT = "test_video_june_03_3.mp4"   # or int(0) for webcam
 STRIDE = 5
 SHOW_SEG = True
 SAVE_VIDEO = True
+# SegFormer inference overrides / benchmarking
+SEG_INPUT_RES = (640, 360)  # (width, height) or None to use processor default
+SEG_BENCHMARK_RESOLUTIONS = [
+    (640, 360),
+]  # resolution specs to benchmark before streaming
+SEG_BENCHMARK_WARMUP = 1
+SEG_BENCHMARK_REPEATS = 5
+SEG_BENCHMARK_VISUALIZE = True
+SEG_BENCHMARK_SAVE = True
+SEG_BENCHMARK_SAVE_DIR = "benchmarks/segformer_samples"
+SEG_BENCHMARK_PREVIEW_WIDTH = 960  # resize width for comparison panels; set 0 to disable resize
+SEG_BENCHMARK_SHOW_MASK = True
+SEG_BENCHMARK_GRID_COLS = 2
+SEG_BENCHMARK_PANEL_GAP = 18
+SEG_BENCHMARK_LABEL_FONT_SCALE = 1.3
+SEG_BENCHMARK_LABEL_THICKNESS = 3
+SEG_BENCHMARK_LABEL_PAD = 8
+SEG_BENCHMARK_LABEL_BG = (255,255,255)
+SEG_BENCHMARK_LABEL_COLOR = (0,0,0)
      # (W, H)
 TRIM_BOTTOM = 30
 CAM_FPS_HINT = 30
@@ -46,9 +65,12 @@ PATH_COLORS = [
 BOTTOM_BAND_PX = 30
 
 # Optional: straighten BEV boundaries by column-wise smoothing
-STRAIGHTEN_EDGES = True
+STRAIGHTEN_EDGES = False
 EDGE_SMOOTH_WIN = 21         # odd window size in pixels
 EDGE_MIN_WIDTH_PX = 8        # ignore columns narrower than this width
+KEEP_MAIN_COMPONENT = True
+MAIN_COMPONENT_BOTTOM_BAND = 45
+MAIN_COMPONENT_CENTER_WEIGHT = 0.35
 
 src_points = np.array([[4, 716], [1275, 716], [777, 291], [654, 289]], dtype=np.float32)  # [BL, BR, TR, TL]
 
@@ -92,6 +114,162 @@ def split_masks_from_output(m, road_id=ROAD_ID, sidewalk_id=SIDEWALK_ID):
         sidewalk = (m==sidewalk_id).astype(np.uint8)*255
         road = (m==road_id).astype(np.uint8)*255
     return sidewalk, road
+
+# ========= Benchmarking =========
+def _resolve_resolution_spec(spec):
+    if spec is None:
+        return None, "native", True
+    if isinstance(spec, str):
+        text = spec.strip().lower()
+        if text in {"native", "default", "none"}:
+            return None, "native", True
+        if "x" in text:
+            parts = text.replace(" ", "").split("x")
+            if len(parts) == 2:
+                w, h = int(parts[0]), int(parts[1])
+                return (w, h), f"{w}x{h}", False
+        if text.isdigit():
+            val = int(text)
+            return (val, val), f"{val}x{val}", False
+        raise ValueError(f"Cannot parse resolution spec: {spec}")
+    if isinstance(spec, (tuple, list)) and len(spec) == 2:
+        w, h = int(spec[0]), int(spec[1])
+        return (w, h), f"{w}x{h}", False
+    if isinstance(spec, int):
+        val = int(spec)
+        return (val, val), f"{val}x{val}", False
+    raise ValueError(f"Unsupported resolution spec: {spec}")
+
+
+def benchmark_segformer_resolutions(detector, frame, specs, warmup=1, repeats=5):
+    if not specs:
+        return
+    prev_mask = detector.previous_mask.copy() if detector.previous_mask is not None else None
+    prev_processed = detector.performance_metrics.processed_count
+    prev_inference = detector.performance_metrics.inference_time
+    original_resize = detector.config.inference_resize
+    viz_entries = []
+    print("\n=== SegFormer Input Resolution Benchmark ===")
+    try:
+        for spec in specs:
+            size_override, label, use_native = _resolve_resolution_spec(spec)
+            detector.previous_mask = prev_mask if prev_mask is None else prev_mask.copy()
+            detector.performance_metrics.processed_count = prev_processed
+            detector.performance_metrics.inference_time = prev_inference
+            if use_native:
+                detector.config.inference_resize = None
+                override_arg = None
+            else:
+                detector.config.inference_resize = original_resize
+                override_arg = size_override
+            warmup_count = max(0, int(warmup))
+            repeat_count = max(1, int(repeats))
+            for _ in range(warmup_count):
+                detector.process_frame(frame, processor_size=override_arg)
+            timings = []
+            for _ in range(repeat_count):
+                t0 = time.perf_counter()
+                detector.process_frame(frame, processor_size=override_arg)
+                timings.append((time.perf_counter() - t0) * 1000.0)
+            mean_ms = float(np.mean(timings)) if timings else float("nan")
+            std_ms = float(np.std(timings)) if len(timings) > 1 else 0.0
+            viz_mask, viz_overlay = detector.process_frame(frame, processor_size=override_arg)
+            detector.previous_mask = prev_mask if prev_mask is None else prev_mask.copy()
+            detector.performance_metrics.processed_count = prev_processed
+            detector.performance_metrics.inference_time = prev_inference
+            print(f"  {label:>10s} : {mean_ms:7.2f} ms  (± {std_ms:5.2f})")
+            if SEG_BENCHMARK_VISUALIZE or SEG_BENCHMARK_SAVE:
+                viz_entries.append({
+                    "label": label,
+                    "mean": mean_ms,
+                    "std": std_ms,
+                    "mask": viz_mask.copy(),
+                    "overlay": viz_overlay.copy(),
+                })
+    finally:
+        detector.config.inference_resize = original_resize
+        detector.previous_mask = prev_mask if prev_mask is None else prev_mask.copy()
+        detector.performance_metrics.processed_count = prev_processed
+        detector.performance_metrics.inference_time = prev_inference
+    print("===========================================\n")
+    if viz_entries and (SEG_BENCHMARK_VISUALIZE or SEG_BENCHMARK_SAVE):
+        panels=[]
+        for entry in viz_entries:
+            panel = entry["overlay"].copy()
+            if SEG_BENCHMARK_SHOW_MASK:
+                mask_color = cv2.cvtColor(entry["mask"], cv2.COLOR_GRAY2BGR)
+                panel = np.hstack((panel, mask_color))
+            text = f"{entry['label']} | {entry['mean']:.1f} ms"
+            font = cv2.FONT_HERSHEY_SIMPLEX
+            scale = float(SEG_BENCHMARK_LABEL_FONT_SCALE)
+            thickness = int(max(1, SEG_BENCHMARK_LABEL_THICKNESS))
+            pad = int(max(0, SEG_BENCHMARK_LABEL_PAD))
+            (tw, th), baseline = cv2.getTextSize(text, font, scale, thickness)
+            x_text = pad
+            y_text = pad + th
+            x1 = max(0, x_text - pad)
+            y1 = max(0, y_text - th - pad)
+            x2 = min(panel.shape[1], x_text + tw + pad)
+            y2 = min(panel.shape[0], y_text + baseline + pad)
+            cv2.rectangle(panel, (x1, y1), (x2, y2), SEG_BENCHMARK_LABEL_BG, -1)
+            cv2.putText(panel, text, (x_text, y_text), font, scale, SEG_BENCHMARK_LABEL_COLOR, thickness, cv2.LINE_AA)
+            if SEG_BENCHMARK_PREVIEW_WIDTH:
+                target_w = int(SEG_BENCHMARK_PREVIEW_WIDTH)
+                if target_w > 0 and panel.shape[1] != target_w:
+                    scale = target_w / float(panel.shape[1])
+                    target_h = max(1, int(round(panel.shape[0] * scale)))
+                    panel = cv2.resize(panel, (target_w, target_h), interpolation=cv2.INTER_AREA)
+            panels.append(panel)
+        if panels:
+            widths = [p.shape[1] for p in panels]
+            heights = [p.shape[0] for p in panels]
+            max_w = max(widths)
+            max_h = max(heights)
+            padded = []
+            for p in panels:
+                h_pad = max_h - p.shape[0]
+                w_pad = max_w - p.shape[1]
+                if w_pad > 0:
+                    pad = np.zeros((p.shape[0], w_pad, 3), dtype=np.uint8)
+                    p = np.hstack((p, pad))
+                if h_pad > 0:
+                    pad = np.zeros((h_pad, p.shape[1], 3), dtype=np.uint8)
+                    p = np.vstack((p, pad))
+                padded.append(p)
+
+            cols = SEG_BENCHMARK_GRID_COLS if SEG_BENCHMARK_GRID_COLS else 1
+            cols = max(1, int(cols))
+            gap = max(0, int(SEG_BENCHMARK_PANEL_GAP))
+            rows = int(math.ceil(len(padded) / float(cols)))
+            blank = np.zeros((max_h, max_w, 3), dtype=np.uint8)
+            row_imgs = []
+            for r in range(rows):
+                chunk = padded[r*cols:(r+1)*cols]
+                while len(chunk) < cols:
+                    chunk.append(blank.copy())
+                if gap > 0:
+                    gap_col = np.zeros((max_h, gap, 3), dtype=np.uint8)
+                    row_img = chunk[0]
+                    for cimg in chunk[1:]:
+                        row_img = np.hstack((row_img, gap_col, cimg))
+                else:
+                    row_img = np.hstack(chunk)
+                row_imgs.append(row_img)
+
+            if gap > 0:
+                gap_row = np.zeros((gap, row_imgs[0].shape[1], 3), dtype=np.uint8)
+                viz_canvas = row_imgs[0]
+                for rimg in row_imgs[1:]:
+                    viz_canvas = np.vstack((viz_canvas, gap_row, rimg))
+            else:
+                viz_canvas = np.vstack(row_imgs)
+            if SEG_BENCHMARK_VISUALIZE:
+                cv2.imshow("SegFormer Resolution Comparison", viz_canvas)
+                cv2.waitKey(1)
+            if SEG_BENCHMARK_SAVE:
+                os.makedirs(SEG_BENCHMARK_SAVE_DIR, exist_ok=True)
+                fname = time.strftime("segformer_compare_%Y%m%d_%H%M%S.png")
+                cv2.imwrite(os.path.join(SEG_BENCHMARK_SAVE_DIR, fname), viz_canvas)
 
 # ========= BEV cleaning =========
 def clean_sidewalk_mask(bev_mask_255, dt_thresh=DT_CORE_THRESH):
@@ -163,6 +341,38 @@ def straighten_bev_edges(mask_255, win=EDGE_SMOOTH_WIN, min_width_px=EDGE_MIN_WI
         y2 = max(0, min(H-1, y2))
         if y2 >= y1:
             out[y1:y2+1, x] = 255
+    return out
+
+
+def select_main_component(mask_255, bottom_band_px=MAIN_COMPONENT_BOTTOM_BAND, center_weight=MAIN_COMPONENT_CENTER_WEIGHT):
+    bin_ = (mask_255 > 0).astype(np.uint8)
+    num, labels, stats, centroids = cv2.connectedComponentsWithStats(bin_, connectivity=8)
+    if num <= 1:
+        return mask_255
+    H, W = mask_255.shape
+    bottom_band_px = int(max(1, min(H, bottom_band_px)))
+    bottom_slice = labels[max(0, H - bottom_band_px):, :]
+    center_x = W / 2.0
+    best_label = None
+    best_score = -1.0
+    for idx in range(1, num):
+        area = float(stats[idx, cv2.CC_STAT_AREA])
+        if area <= 0:
+            continue
+        touches_bottom = bool(np.any(bottom_slice == idx))
+        cx, _ = centroids[idx]
+        center_bonus = 1.0 - min(1.0, abs(cx - center_x) / (center_x + 1e-6))
+        score = area
+        if touches_bottom:
+            score += area * 0.5
+        score += area * float(center_weight) * max(0.0, center_bonus)
+        if score > best_score:
+            best_score = score
+            best_label = idx
+    if best_label is None:
+        best_label = 1 + np.argmax(stats[1:, cv2.CC_STAT_AREA])
+    out = np.zeros_like(mask_255, dtype=np.uint8)
+    out[labels == best_label] = 255
     return out
 
 # ========= Skeletonization =========
@@ -303,13 +513,17 @@ def put_hud_panel(img, lines, org=(10, 25), scale=0.7):
 
 # ========= Main =========
 def main():
-    cfg=Config(model_dir=MODEL_DIR, conf_thresh=CONF_THRESH, road_id=ROAD_ID)
+    cfg_resize = None
+    if SEG_INPUT_RES is not None:
+        size_override, _, use_native = _resolve_resolution_spec(SEG_INPUT_RES)
+        cfg_resize = None if use_native else size_override
+    cfg=Config(model_dir=MODEL_DIR, conf_thresh=CONF_THRESH, road_id=ROAD_ID, inference_resize=cfg_resize)
     model=FastRoadDetector(cfg)
     cap=cv2.VideoCapture(INPUT if not str(INPUT).isdigit() else int(INPUT))
     if not cap.isOpened():
         print(f"ERROR: cannot open {INPUT}"); return
     fps_in=cap.get(cv2.CAP_PROP_FPS) or CAM_FPS_HINT
-    frame_id=0; times=[]; last_mask=None; last_waypoints_cam=None
+    frame_id=0; times=[]; last_mask=None; last_waypoints_cam=None; did_benchmark=False
 
     # Lazy-init video writer after first composed frame (to know exact size)
     vw_demo=None
@@ -321,6 +535,16 @@ def main():
         ok,frame=cap.read()
         if not ok: break
         run_net=(frame_id%STRIDE==0)
+
+        if SEG_BENCHMARK_RESOLUTIONS and not did_benchmark:
+            benchmark_segformer_resolutions(
+                model,
+                frame,
+                SEG_BENCHMARK_RESOLUTIONS,
+                warmup=SEG_BENCHMARK_WARMUP,
+                repeats=SEG_BENCHMARK_REPEATS
+            )
+            did_benchmark=True
 
         # 1) Inference
         timing.start("inference")
@@ -344,6 +568,12 @@ def main():
         bev_sidewalk = clean_sidewalk_mask(bev_sidewalk, DT_CORE_THRESH)
         if STRAIGHTEN_EDGES:
             bev_sidewalk = straighten_bev_edges(bev_sidewalk, EDGE_SMOOTH_WIN, EDGE_MIN_WIDTH_PX)
+        if KEEP_MAIN_COMPONENT:
+            bev_sidewalk = select_main_component(
+                bev_sidewalk,
+                bottom_band_px=MAIN_COMPONENT_BOTTOM_BAND,
+                center_weight=MAIN_COMPONENT_CENTER_WEIGHT,
+            )
         timing.end("bev")
 
         # 4) Skeleton
